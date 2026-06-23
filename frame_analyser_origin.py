@@ -52,7 +52,7 @@ def build_default_config():
             "sessions_dir": "sessions",
         },
         "parallel": {
-            "n_workers": 8,
+            "n_workers": 4,
             "chunksize": 1,
         },
     }
