@@ -1178,7 +1178,7 @@ time = make_time_array(M=len(indices), sample_dt=1, sim_dt=64, t0=192)
 print(f'time:{time}')
 list_agama_pot=[]
 for index in indices:
-    df,frame_pos,vel=make_frame(f"Sequence_frame/r10A_{index}.txt")
+    df,frame_pos,vel=make_frame(f"Sequence_frame/r10A{index}.txt")
     KE=calculate_kinetic_energy_tensor(df)
     eigenvalues,R=diagonalize_kinetic_energy_tensor(KE)
     trans_pos=transform_coordinates_to_eigenbasis(frame_pos,R)

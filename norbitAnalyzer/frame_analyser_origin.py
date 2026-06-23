@@ -6,18 +6,14 @@ from pylab import *
 import os
 import time
 import glob
-import shlex
-import shutil
-import subprocess
-import sys
 import yaml
-import uuid
 from datetime import datetime
 from pathlib import Path
-
+from functools import partial
 # -----------------------------------------------------------
 # Config loading + session snapshotting
 # -----------------------------------------------------------
+
 def build_default_config():
     return {
         "version": 1,
@@ -54,6 +50,7 @@ def build_default_config():
         "parallel": {
             "n_workers": 4,
             "chunksize": 1,
+            "no_plot":True,
         },
     }
 
@@ -103,23 +100,21 @@ def ensure_config_exists(config_path):
     )
 
 
+
 # Path to the yaml config. Override with FRAME_ANALYSER_CONFIG=... if needed.
-CONFIG_PATH = os.environ.get("FRAME_ANALYSER_CONFIG", "config.yaml")
-ensure_config_exists(CONFIG_PATH)
+CONFIG_PATH = Path(os.environ.get("FRAME_ANALYSER_CONFIG", "norbitconfig.yaml"))
+
+if not CONFIG_PATH.exists():
+    raise SystemExit(f"Config file not found: {CONFIG_PATH.resolve()}")
 
 with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
     CONFIG = yaml.safe_load(_f)
 
-# Unique id for this run. Every settings snapshot, and optionally every
-# output folder, can be tagged with this so you can trace which config
-# produced which results.
-SESSION_ID = uuid.uuid4().hex[:8]
-
 
 def save_session_snapshot(extra=None):
     """
-    Write out the exact config used for this run, tagged with SESSION_ID
-    and a timestamp, so past runs stay reproducible/traceable.
+    Write out the exact config used for this run with a timestamp so
+    past runs stay reproducible/traceable.
 
     Parameters
     ----------
@@ -130,11 +125,10 @@ def save_session_snapshot(extra=None):
     -------
     Path to the saved snapshot file.
     """
-    sessions_dir = Path(CONFIG.get("output", {}).get("sessions_dir", "sessions"))
-    sessions_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(CONFIG.get("output", {}).get("root", "sos_output"))
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     snapshot = {
-        "session_id": SESSION_ID,
         "config_version": CONFIG.get("version"),
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "config": CONFIG,
@@ -142,11 +136,11 @@ def save_session_snapshot(extra=None):
     if extra:
         snapshot.update(extra)
 
-    snapshot_path = sessions_dir / f"session_{SESSION_ID}.yaml"
-    with open(snapshot_path, "w") as f:
+    snapshot_path = output_dir / "sossnapconfig.yaml"
+    with open(snapshot_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(snapshot, f, sort_keys=False)
 
-    print(f"[session {SESSION_ID}] settings snapshot saved to {snapshot_path}")
+    print(f"Settings snapshot saved to {snapshot_path}")
     return snapshot_path
 
 
@@ -822,7 +816,7 @@ def extract_frame_decimal(file_path: str) -> int | None:
 
 
 # ---------- worker ----------
-def thread(file_path):
+def thread(file_path,no_plot):
     """
     Worker function executed in parallel.
     Returns something small (e.g., frame id and a result summary)
@@ -865,13 +859,20 @@ def thread(file_path):
     frame_dec = extract_frame_decimal(file_path)     # e.g. 2816
 
     print(f"[frame hex={frame_hex} dec={frame_dec}] processing {file_path}")
-
-    lyp_list = run_sample_no_plot(
-        sampled,
-        potential2,
-        step=CONFIG["sampling"]["step"],
-        frame=f"frame_{frame_hex}",   # or use frame_dec if you prefer
-    )
+    if no_plot==True:
+        lyp_list = run_sample_no_plot(
+            sampled,
+            potential2,
+            step=CONFIG["sampling"]["step"],
+            frame=f"frame_{frame_hex}",   # or use frame_dec if you prefer
+        )
+    else:
+        lyp_list = run_sample(
+            sampled,
+            potential2,
+            step=CONFIG["sampling"]["step"],
+            frame=f"frame_{frame_hex}",   # or use frame_dec if you prefer
+        )
 
 
     # Return something the parent can store/inspect
@@ -879,27 +880,26 @@ def thread(file_path):
 
 
 # ---------- main multiprocessing launcher ----------
-def run_parallel(file_paths, n_workers=4, chunksize=1):
+def run_parallel(file_paths, no_plot, n_workers=4, chunksize=1):
     """
     Runs `thread` over all file_paths with multiprocessing.
     """
     n_workers = min(n_workers, cpu_count(), len(file_paths))
     print(f"Using {n_workers} worker(s) on {len(file_paths)} frame(s).")
 
+    worker = partial(thread, no_plot=no_plot)
+
     results = []
     with Pool(processes=n_workers) as pool:
-        # imap_unordered streams results as workers finish
-        for out in pool.imap_unordered(thread, file_paths, chunksize=chunksize):
+        for out in pool.imap_unordered(worker, file_paths, chunksize=chunksize):
             results.append(out)
 
-    # Sort results by numeric frame if possible
     def sort_key(x):
         frame, _ = x
         return int(frame) if str(frame).isdigit() else frame
 
     results.sort(key=sort_key)
     return results
-
 
 #------------sampeling the frames unifrmly wtihin a time range-------------------
 
@@ -1023,21 +1023,22 @@ if __name__ == "__main__":
         CONFIG["frames"]["stop"],
         CONFIG["frames"]["step"],
     )
-
+    
     print(len(indices))
     for index in indices:
         fname = CONFIG["frames"]["filename_pattern"].format(index=index)
         file_paths.append(os.path.join(CONFIG["frames"]["dir"], fname))
 
-    # Snapshot the exact settings used for this run, tagged with SESSION_ID.
-    # Saved to sessions/session_<SESSION_ID>.yaml
+    # Snapshot the exact settings used for this run.
+    # Saved to sos_output/sossnapconfig.yaml
     save_session_snapshot(extra={"n_frames": len(file_paths)})
 
     run_start = time.time()
     results = run_parallel(
         file_paths,
+        no_plot=CONFIG["parallel"]["no_plot"],
         n_workers=CONFIG["parallel"]["n_workers"],
         chunksize=CONFIG["parallel"]["chunksize"],
     )
     run_stop = time.time()
-    print(f"[session {SESSION_ID}] Running time: {run_stop - run_start:.3f}s")
+    print(f"Running time: {run_stop - run_start:.3f}s")
