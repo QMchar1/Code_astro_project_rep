@@ -4,7 +4,198 @@ import agama
 import matplotlib.pyplot as plt
 from pylab import *
 import os
+import time
+import glob
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import yaml
+import uuid
+from datetime import datetime
 from pathlib import Path
+
+# -----------------------------------------------------------
+# Config loading + session snapshotting
+# -----------------------------------------------------------
+def infer_default_frames_config():
+    default = {
+        "dir": "Sequence_frame",
+        "filename_pattern": "r10A{index}.txt",
+        "start": "7000",
+        "stop": "10000",
+        "step": "40",
+    }
+
+    frames_dir = Path(default["dir"])
+    if not frames_dir.is_dir():
+        return default
+
+    frame_paths = sorted(
+        path for path in frames_dir.iterdir()
+        if path.is_file() and not path.name.startswith(".")
+    )
+    if len(frame_paths) < 2:
+        return default
+
+    suffixes = {path.suffix for path in frame_paths}
+    if len(suffixes) != 1:
+        return default
+
+    suffix = suffixes.pop()
+    stems = [path.stem for path in frame_paths]
+    prefix = os.path.commonprefix(stems)
+    indices = []
+
+    for stem in stems:
+        token = stem[len(prefix):]
+        if not token or not re.fullmatch(r"[0-9a-fA-F]+", token):
+            return default
+        indices.append(int(token, 16))
+
+    indices = sorted(set(indices))
+    positive_steps = [
+        curr - prev for prev, curr in zip(indices, indices[1:]) if curr > prev
+    ]
+
+    return {
+        "dir": str(frames_dir),
+        "filename_pattern": f"{prefix}{{index}}{suffix}",
+        "start": f"{indices[0]:x}",
+        "stop": f"{indices[-1]:x}",
+        "step": f"{(min(positive_steps) if positive_steps else int(default['step'], 16)):x}",
+    }
+
+
+def build_default_config():
+    return {
+        "version": 1,
+        "frames": infer_default_frames_config(),
+        "sampling": {
+            "step": 128,
+            "start": 0,
+        },
+        "potential": {
+            "type": "Multipole",
+            "symmetry": "axisymmetric",
+        },
+        "orbit": {
+            "n_orbit": 100,
+            "trajsize": 3000000,
+            "accuracy": 1e-8,
+        },
+        "plotting": {
+            "sos_marker_size": 5,
+            "sos_marker_color": "r",
+            "range": [-10, 10],
+            "n_points": 500,
+        },
+        "output": {
+            "root": "sos_output",
+            "sessions_dir": "sessions",
+        },
+        "parallel": {
+            "n_workers": 4,
+            "chunksize": 1,
+        },
+    }
+
+
+def launch_config_file(config_path):
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    launch_commands = []
+
+    if editor:
+        launch_commands.append(shlex.split(editor) + [str(config_path)])
+
+    if sys.platform.startswith("win"):
+        try:
+            os.startfile(config_path)  # type: ignore[attr-defined]
+            return True
+        except OSError:
+            pass
+    else:
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        if shutil.which(opener):
+            launch_commands.append([opener, str(config_path)])
+
+    for command in launch_commands:
+        try:
+            subprocess.Popen(command)
+            return True
+        except OSError:
+            continue
+
+    return False
+
+
+def ensure_config_exists(config_path):
+    config_path = Path(config_path)
+    if config_path.exists():
+        return
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    default_config = build_default_config()
+
+    with open(config_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(default_config, handle, sort_keys=False)
+
+    print(f"Created default config at {config_path.resolve()}")
+    launched = launch_config_file(config_path)
+    action = "opened" if launched else "could not be opened automatically"
+
+    raise SystemExit(
+        f"No config file was found. A default config was created at "
+        f"{config_path.resolve()} and {action}. Update it, then rerun the program."
+    )
+
+
+# Path to the yaml config. Override with FRAME_ANALYSER_CONFIG=... if needed.
+CONFIG_PATH = os.environ.get("FRAME_ANALYSER_CONFIG", "config.yaml")
+ensure_config_exists(CONFIG_PATH)
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
+    CONFIG = yaml.safe_load(_f)
+
+# Unique id for this run. Every settings snapshot, and optionally every
+# output folder, can be tagged with this so you can trace which config
+# produced which results.
+SESSION_ID = uuid.uuid4().hex[:8]
+
+
+def save_session_snapshot(extra=None):
+    """
+    Write out the exact config used for this run, tagged with SESSION_ID
+    and a timestamp, so past runs stay reproducible/traceable.
+
+    Parameters
+    ----------
+    extra : dict, optional
+        Any additional run-specific info to record (e.g. n_frames, n_workers).
+
+    Returns
+    -------
+    Path to the saved snapshot file.
+    """
+    sessions_dir = Path(CONFIG.get("output", {}).get("sessions_dir", "sessions"))
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    snapshot = {
+        "session_id": SESSION_ID,
+        "config_version": CONFIG.get("version"),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "config": CONFIG,
+    }
+    if extra:
+        snapshot.update(extra)
+
+    snapshot_path = sessions_dir / f"session_{SESSION_ID}.yaml"
+    with open(snapshot_path, "w") as f:
+        yaml.safe_dump(snapshot, f, sort_keys=False)
+
+    print(f"[session {SESSION_ID}] settings snapshot saved to {snapshot_path}")
+    return snapshot_path
 
 
 def calculate_kinetic_energy_tensor(df):
@@ -207,9 +398,9 @@ def get_potential(transformed_positions_df):
 
     # --- Construct the frozen AGAMA potential ---
     potential = agama.Potential(
-        type="Multipole",
+        type=CONFIG["potential"]["type"],
         particles=(positions, mass_array),
-        symmetry="axisymmetric"
+        symmetry=CONFIG["potential"]["symmetry"]
     )
 
     # --- sanity_checks ---
@@ -219,25 +410,16 @@ def get_potential(transformed_positions_df):
     return potential
 
 
+def runOrbit(pot, initial_conditions, N_orbit=None, trajsize=None, acc=None):
 
-
-
-
-
-
-
-
-
-def runOrbit(pot,initial_conditions,N_orbit=100,trajsize=3000000,acc=1e-8):
+  # fall back to config.yaml values when not explicitly overridden
+  N_orbit  = CONFIG["orbit"]["n_orbit"]  if N_orbit  is None else N_orbit
+  trajsize = CONFIG["orbit"]["trajsize"] if trajsize is None else trajsize
+  acc      = CONFIG["orbit"]["accuracy"] if acc      is None else acc
 
   orbit=agama.orbit(potential=pot, ic=initial_conditions, lyapunov=True,time=N_orbit*pot.Tcirc(initial_conditions), trajsize=trajsize,accuracy=acc)
 
-
   return orbit
-
-
-
-
 
 
 # -----------------------------------------------------------
@@ -246,7 +428,7 @@ def runOrbit(pot,initial_conditions,N_orbit=100,trajsize=3000000,acc=1e-8):
 
 
 
-def sos_plot(orb, lyp, outdir=None, prefix="", s=5, c='r'):
+def sos_plot(orb, lyp, outdir=None, prefix="", s=None, c=None):
     """
     Create a 4-panel diagnostic plot:
         1. Surface of section (R, vR)
@@ -265,6 +447,8 @@ def sos_plot(orb, lyp, outdir=None, prefix="", s=5, c='r'):
     prefix : str, optional
         Filename prefix.
     """
+    s = CONFIG["plotting"]["sos_marker_size"]  if s is None else s
+    c = CONFIG["plotting"]["sos_marker_color"] if c is None else c
 
     # ---------------------------------------
     # Precompute quantities
@@ -431,7 +615,7 @@ def run_sample(sample, potential, step,frame):
     lyp_list = []
 
     #  Main and subdirectories
-    outdir = Path(f"sos_output/step{step}_frame{frame}")
+    outdir = Path(CONFIG["output"]["root"]) / f"step{step}_frame{frame}"
     chaotic_dir = outdir / "chaotic"
     regular_dir = outdir / "regular"
     chaotic_dir.mkdir(parents=True, exist_ok=True)
@@ -513,7 +697,7 @@ def run_sample_no_plot(sample, potential, step,frame):
     lyp_list = []
 
     #  Main and subdirectories
-    outdir = Path(f"sos_output/step{step}_frame{frame}")
+    outdir = Path(CONFIG["output"]["root"]) / f"step{step}_frame{frame}"
     chaotic_dir = outdir / "chaotic"
     regular_dir = outdir / "regular"
     chaotic_dir.mkdir(parents=True, exist_ok=True)
@@ -591,9 +775,11 @@ def plot_potential (potential):
   return: none 
   """
   try:
-    x_range = np.linspace(-5,5, 1000)
-    y_range = np.linspace(-5 ,5, 1000)
-    z_range = np.linspace(-5, 5, 1000)
+    lo, hi = CONFIG["plotting"]["range"]
+    n_pts = CONFIG["plotting"]["n_points"]
+    x_range = np.linspace(lo, hi, n_pts)
+    y_range = np.linspace(lo, hi, n_pts)
+    z_range = np.linspace(lo, hi, n_pts)
     potential_x1 = [potential.potential(xi, 0, 0) for xi in x_range]
     potential_y1 = [potential.potential(0, yi, 0) for yi in y_range]
     potential_z1 = [potential.potential(0, 0, zi) for zi in z_range]
@@ -654,7 +840,6 @@ lyp_list = run_sample(sampled, potential2, step=1024)
 #--------------------------------------
 #production  mode
 #-------------------------------------
-import re
 from multiprocessing import Pool, cpu_count
 
 # ---------- helpers ----------
@@ -718,7 +903,11 @@ def thread(file_path):
     # If you *must* plot, do it in the parent after collecting results.
     # plot_potential(potential2)
 
-    sampled = sample_particles(transformed_positions_df, transformed_velocities_df, step=128,start=600001)#600 001
+    sampled = sample_particles(
+        transformed_positions_df, transformed_velocities_df,
+        step=CONFIG["sampling"]["step"],
+        start=CONFIG["sampling"]["start"],
+    )
     frame_hex = extract_frame_id(file_path)          # e.g. "0b00"
     frame_dec = extract_frame_decimal(file_path)     # e.g. 2816
 
@@ -727,7 +916,7 @@ def thread(file_path):
     lyp_list = run_sample_no_plot(
         sampled,
         potential2,
-        step=128,
+        step=CONFIG["sampling"]["step"],
         frame=f"frame_{frame_hex}",   # or use frame_dec if you prefer
     )
 
@@ -871,19 +1060,31 @@ def generate_hex_indices(start, stop, step):
         i += step_i
 
     return indices
-file_paths=[]
-indices =generate_hex_indices("7000", "8000", "40")
+# -----------------------------------------------------------
+# production run, driven by config.yaml
+# -----------------------------------------------------------
+if __name__ == "__main__":
+    file_paths = []
+    indices = generate_hex_indices(
+        CONFIG["frames"]["start"],
+        CONFIG["frames"]["stop"],
+        CONFIG["frames"]["step"],
+    )
 
-print(len(indices))
-for index in indices:
-    file_paths.append(os.path.join('Sequence_frame',f"r10A_{index}.txt"))
+    print(len(indices))
+    for index in indices:
+        fname = CONFIG["frames"]["filename_pattern"].format(index=index)
+        file_paths.append(os.path.join(CONFIG["frames"]["dir"], fname))
 
+    # Snapshot the exact settings used for this run, tagged with SESSION_ID.
+    # Saved to sessions/session_<SESSION_ID>.yaml
+    save_session_snapshot(extra={"n_frames": len(file_paths)})
 
-start = time.time()
-# run 4 threads (processes) in parallel
-#file_paths=['Sequence_frame/r10A_0000.txt','Sequence_frame/r10A_0b00.txt','Sequence_frame/r10A_0c00.txt','Sequence_frame/r10A_0d40.txt','Sequence_frame/r10A_0e80.txt','Sequence_frame/r10A_0fc0.txt']
-results = run_parallel(file_paths, n_workers=8, chunksize=1)
-stop = time.time()
-print(f"Running time: {stop - start:.3f}s")
-
-
+    run_start = time.time()
+    results = run_parallel(
+        file_paths,
+        n_workers=CONFIG["parallel"]["n_workers"],
+        chunksize=CONFIG["parallel"]["chunksize"],
+    )
+    run_stop = time.time()
+    print(f"[session {SESSION_ID}] Running time: {run_stop - run_start:.3f}s")
