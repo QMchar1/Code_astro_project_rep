@@ -6,7 +6,6 @@ from pylab import *
 import os
 import time
 import glob
-import re
 import shlex
 import shutil
 import subprocess
@@ -19,59 +18,16 @@ from pathlib import Path
 # -----------------------------------------------------------
 # Config loading + session snapshotting
 # -----------------------------------------------------------
-def infer_default_frames_config():
-    default = {
-        "dir": "Sequence_frame",
-        "filename_pattern": "r10A{index}.txt",
-        "start": "7000",
-        "stop": "10000",
-        "step": "40",
-    }
-
-    frames_dir = Path(default["dir"])
-    if not frames_dir.is_dir():
-        return default
-
-    frame_paths = sorted(
-        path for path in frames_dir.iterdir()
-        if path.is_file() and not path.name.startswith(".")
-    )
-    if len(frame_paths) < 2:
-        return default
-
-    suffixes = {path.suffix for path in frame_paths}
-    if len(suffixes) != 1:
-        return default
-
-    suffix = suffixes.pop()
-    stems = [path.stem for path in frame_paths]
-    prefix = os.path.commonprefix(stems)
-    indices = []
-
-    for stem in stems:
-        token = stem[len(prefix):]
-        if not token or not re.fullmatch(r"[0-9a-fA-F]+", token):
-            return default
-        indices.append(int(token, 16))
-
-    indices = sorted(set(indices))
-    positive_steps = [
-        curr - prev for prev, curr in zip(indices, indices[1:]) if curr > prev
-    ]
-
-    return {
-        "dir": str(frames_dir),
-        "filename_pattern": f"{prefix}{{index}}{suffix}",
-        "start": f"{indices[0]:x}",
-        "stop": f"{indices[-1]:x}",
-        "step": f"{(min(positive_steps) if positive_steps else int(default['step'], 16)):x}",
-    }
-
-
 def build_default_config():
     return {
         "version": 1,
-        "frames": infer_default_frames_config(),
+        "frames": {
+            "dir": "Sequence_frame",
+            "filename_pattern": "r10A_{index}.txt",
+            "start": "7000",
+            "stop": "10000",
+            "step": "40",
+        },
         "sampling": {
             "step": 128,
             "start": 0,
@@ -88,15 +44,15 @@ def build_default_config():
         "plotting": {
             "sos_marker_size": 5,
             "sos_marker_color": "r",
-            "range": [-10, 10],
-            "n_points": 500,
+            "range": [-5, 5],
+            "n_points": 1000,
         },
         "output": {
             "root": "sos_output",
             "sessions_dir": "sessions",
         },
         "parallel": {
-            "n_workers": 4,
+            "n_workers": 8,
             "chunksize": 1,
         },
     }
@@ -136,18 +92,14 @@ def ensure_config_exists(config_path):
         return
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    default_config = build_default_config()
-
     with open(config_path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(default_config, handle, sort_keys=False)
+        yaml.safe_dump(build_default_config(), handle, sort_keys=False)
 
-    print(f"Created default config at {config_path.resolve()}")
     launched = launch_config_file(config_path)
     action = "opened" if launched else "could not be opened automatically"
-
     raise SystemExit(
-        f"No config file was found. A default config was created at "
-        f"{config_path.resolve()} and {action}. Update it, then rerun the program."
+        f"Created missing config at {config_path.resolve()} and {action}. "
+        "Update it, then rerun the program."
     )
 
 
@@ -840,6 +792,7 @@ lyp_list = run_sample(sampled, potential2, step=1024)
 #--------------------------------------
 #production  mode
 #-------------------------------------
+import re
 from multiprocessing import Pool, cpu_count
 
 # ---------- helpers ----------
