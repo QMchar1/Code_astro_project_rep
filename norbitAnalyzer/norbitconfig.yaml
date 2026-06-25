@@ -1,0 +1,39 @@
+# config.yaml — settings for frame_analyser_origin.py
+# bump `version` whenever you change values here in a way worth tracking;
+# it gets stamped into every session snapshot under sessions/
+
+version: 1
+
+frames:
+  dir: "Sequence_frame"
+  filename_pattern: "r10A_{index}.txt"   # underscore matches extract_frame_id()
+  start: "7000"   # hex, inclusive
+  stop:  "8000"   # hex, inclusive
+  step:  "40"     # hex increment
+
+parallel:
+  n_workers: 8
+  chunksize: 1
+
+orbit:
+  n_orbit: 100
+  trajsize: 3000000
+  accuracy: 1.0e-8
+
+sampling:
+  step: 128
+  start: 600001
+
+potential:
+  type: "Multipole"
+  symmetry: "axisymmetric"
+
+plotting:
+  range: [-5, 5]
+  n_points: 1000
+  sos_marker_size: 5
+  sos_marker_color: "r"
+
+output:
+  root: "sos_output"
+  sessions_dir: "sessions"
